@@ -1,6 +1,6 @@
 import math
 from pathlib import Path
-from typing import Dict, Any, List, Literal
+from typing import Dict, Any, List, Literal, Union
 import multiprocessing as mp
 import click
 
@@ -33,19 +33,64 @@ def farthest_point_sampling(xyz: np.ndarray, M: int) -> np.ndarray:
         selected[i] = np.argmax(distances)
     return xyz[selected]
 
-def get_grid_poses(lat: Lattice, num_spnode: int) -> torch.Tensor:
-    num_grid = round(num_spnode ** (1/3))
-    assert num_grid ** 3 == num_spnode
+def get_grid_poses(lat: Lattice, num_spnode: Union[int, float]) -> torch.Tensor:
+    """
+    如果 num_spnode 是整数：
+        与原逻辑一致，三个方向上都是 num_spnode 个点（立方网格）。
+    如果 num_spnode 是浮点数：
+        视为网格分辨率（单位长度上的步长），
+        沿每个晶格矢量的网格点数 = floor(该方向晶格矢量长度 / num_spnode)，向下取整，
+        并且至少为 1。
+    """
+    # -------- 判断类型 --------
+    if isinstance(num_spnode, int):
+        # 保持原来的立方网格行为
+        nx = ny = nz = int(num_spnode)
+    else:
+        # 视为分辨率（例如 Å/格点）
+        res = float(num_spnode)
+
+        # 这里假设 lat 有类似 pymatgen.Lattice 的接口
+        # 如果你的 Lattice 不一样，把这一行改成对应的获取三个晶格向量长度的方法即可
+        a, b, c = lat.abc   # 或者 lat.lengths / lat.get_lengths() 等
+
+        # 沿每个方向的网格点数 = floor(length / res)，向下取整，并至少为 1
+        nx = max(int(a // res), 1)
+        ny = max(int(b // res), 1)
+        nz = max(int(c // res), 1)
+
+        print("DEBUG resolution based sampling", nx, ny, nz, a, b, c)
+
     grid_poses = []
-    for i in range(num_grid):
-        for j in range(num_grid):
-            for k in range(num_grid):
-                grid_pos = lat.get_cartesian_coords(
-                    [i / num_grid, j / num_grid, k / num_grid]
-                )
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                # 分数坐标：中心采样 (i+0.5)/n
+                frac_coords = [
+                    (i + 0.5) / nx,
+                    (j + 0.5) / ny,
+                    (k + 0.5) / nz,
+                ]
+                grid_pos = lat.get_cartesian_coords(frac_coords)
                 grid_poses.append(torch.from_numpy(grid_pos).float())
-    grid_poses = torch.stack(grid_poses)  # [N, 3]
+
+    grid_poses = torch.stack(grid_poses, dim=0)  # [N, 3]
     return grid_poses
+
+# def get_grid_poses(lat: Lattice, num_spnode: int) -> torch.Tensor:
+#     # num_grid = round(num_spnode ** (1/3))
+#     # assert num_grid ** 3 == num_spnode
+#     num_grid = num_spnode
+#     grid_poses = []
+#     for i in range(num_grid):
+#         for j in range(num_grid):
+#             for k in range(num_grid):
+#                 grid_pos = lat.get_cartesian_coords(
+#                     [i / num_grid + 0.5, j / num_grid + 0.5, k / num_grid + 0.5]
+#                 )
+#                 grid_poses.append(torch.from_numpy(grid_pos).float())
+#     grid_poses = torch.stack(grid_poses)  # [N, 3]
+#     return grid_poses
 
 def repulsion_filter_and_sample(pos: npt.NDArray, points: npt.NDArray, repulsion_distance: float, num_points: int):
     # === Repulsion filter
@@ -103,6 +148,7 @@ def add_spatial_nodes(data: Data, spnode_z: int, num_spnode: int, sample_method:
     X = data["atomic_numbers"]
 
     lattice_obj = Lattice(cell)
+    assert sample_method == 'grid'
     if sample_method == 'uniform':
         spnode_pos = get_uniform_poses(pos, lattice_obj, num_spnode, repulsion_distance)
     elif sample_method == 'inverse_density':
@@ -158,6 +204,11 @@ def build_graph_i(matid: str, data_config: Dict[str, Any]) -> bool:
         logger.debug(f"Original structure has {len(atoms)} atoms")
         atoms = _make_supercell(atoms, cutoff=data_config['structure']['min_lat_len'])
         logger.debug(f"Supercell has {len(atoms)} atoms after expansion")
+
+        if data_config.get('scale') is not None:
+            olen = len(atoms)
+            atoms = _make_supercell(atoms, scale=data_config['scale'])
+            print("DEBUG SUPERCELL", data_config['scale'], olen, len(atoms))
         
         # Check supercell constraints
         cell_params = atoms.cell.cellpar()

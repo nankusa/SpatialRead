@@ -10,9 +10,7 @@ from torch_geometric.data import Data
 from pymatgen.core.lattice import Lattice
 
 # JMP
-from spatialread.modules.jmp.models.gemnet.backbone import GemNetOCBackbone
-from spatialread.modules.jmp.models.gemnet.config import BackboneConfig
-from spatialread.modules.jmp.utils.goc_graph import (
+from spatialread.utils.goc_graph import (
     Cutoffs,
     Graph,
     MaxNeighbors,
@@ -21,29 +19,51 @@ from spatialread.modules.jmp.utils.goc_graph import (
     tag_mask,
 )
 
-from spatialread.config import init_config, get_config, get_model_config, get_data_config, get_train_config
+from spatialread.config import (
+    init_config,
+    get_config,
+    get_model_config,
+    get_data_config,
+    get_train_config,
+)
 from spatialread.utils.log import get_logger
-from spatialread.utils.radius_graph import radius_graph_pbc
+
+# from spatialread.utils.graph import radius_graph_pbc_ase
 
 from typing import List, Union, Any, Dict
 
 
-class JMP():
-    def __init__(self, config, device):
+class JMP:
+    def __init__(
+        self,
+        config,
+        device,
+        sp: bool = False,
+        cutoff: float = 12.0,
+        max_neighbors: int = 30,
+    ):
         self.logger = get_logger(filename=Path(__file__).stem)
 
         # Get parameters from config
-        self.override = config['override']
+        self.override = config["override"]
 
         self.graph_dir = config["graph_dir"]
-        self.gemnet_dir = config['gemnet_dir']
+        self.gemnet_dir = config["gemnet_dir"]
 
-        self.spnode_config = config['spnode']
+        self.spgraph_dir = config["spgraph_dir"]
+        self.spgemnet_dir = config["spgemnet_dir"]
 
-        self.device = device
+        self.spnode_config = config["spnode"]
 
         # Load target values
         self.df = config["matid_df"]
+
+        self.device = device
+
+        self.sp = sp
+
+        self.cutoff = cutoff
+        self.max_neighbors = max_neighbors
 
     def generate_graphs(
         self,
@@ -107,14 +127,15 @@ class JMP():
 
         data.fixed = torch.zeros(data.natoms, dtype=torch.bool).to(device)
 
-        cutoff = 8
-        max_neighbors = 8
+        cutoff = self.cutoff
+        max_neighbors = self.max_neighbors
+        # # if self.config.conditional_max_neighbors:
         # if data.natoms > 300:
         #     max_neighbors = 5
         # elif data.natoms > 200:
         #     max_neighbors = 10
         # else:
-        #     max_neighbors = 20
+        #     max_neighbors = 30
 
         # cutoff = 19
         # max_neighbors = 8
@@ -132,41 +153,83 @@ class JMP():
         return data
 
     def process_material(self, matid: str):
-        try:
-            if (self.gemnet_dir / f'{matid}.pt').exists() and not self.override:
-                self.logger.info(f"Material {matid} already processed, skip")
-                return
-            self.logger.info(f"Start to process gemnet data of {matid}")
-            data = torch.load(self.graph_dir / f'{matid}.pt', weights_only=False, map_location=self.device)
-            # if len(data.atomic_numbers) > 512 + 768:
-            #     self.logger.info(
-            #         f"Skip {matid} - {self.graph_dir / f'{matid}.pt'} with {len(data.atomic_numbers)} atoms"
-            #     )
-            #     return False
-            try:
-                graph = self.data_transform(data).to('cpu')
-            except torch.cuda.OutOfMemoryError:
-                self.logger.warn(f"Fail to process gemnet data of {matid}: out of memory, use cpu instead")
-                data = data.to('cpu')
-                graph = self.data_transform(data).to('cpu')
-            except Exception as e:
-                self.logger.error(f"Fail to process gemnet data of {matid}: {e}")
-                return
-            torch.save(graph, self.gemnet_dir / f'{matid}.pt')
-            self.logger.info(f"Finish to process gemnet data of {matid}")
-        except Exception as e:
-            self.logger.error(f"Fail to process gemnet data of {matid}: {e}")
+        if not self.sp:
+            # try:
+            skip = False
+            if (self.gemnet_dir / f"{matid}.pt").exists() and not self.override:
+                try:
+                    torch.load(
+                        self.gemnet_dir / f"{matid}.pt",
+                        weights_only=False,
+                        map_location="cpu",
+                    )
+                    skip = True
+                    self.logger.info(f"Material {matid} already processed, skip")
+                except Exception as e:
+                    self.logger.info(
+                        f"Material {matid}'s gemnet data is broken, reprocess", e
+                    )
+                    skip = False
+
+            if not skip:
+                self.logger.info(f"Start to process gemnet data of {matid}")
+                data = torch.load(
+                    self.graph_dir / f"{matid}.pt",
+                    weights_only=False,
+                    map_location=self.device,
+                )
+                graph = self.data_transform(data).to("cpu")
+                torch.save(graph, self.gemnet_dir / f"{matid}.pt")
+        else:
+            skip = False
+            if (self.spgemnet_dir / f"{matid}.pt").exists() and not self.override:
+                try:
+                    torch.load(
+                        self.spgemnet_dir / f"{matid}.pt",
+                        weights_only=False,
+                        map_location="cpu",
+                    )
+                    skip = True
+                    self.logger.info(
+                        f"Material spatial {matid} already processed, skip"
+                    )
+                except Exception as e:
+                    self.logger.info(
+                        f"Material {matid}'s gemnet data is broken, reprocess", e
+                    )
+                    skip = False
+
+            if not skip:
+                self.logger.info(f"Finish to process gemnet data of {matid}")
+                data = torch.load(
+                    self.spgraph_dir / f"{matid}.pt",
+                    weights_only=False,
+                    map_location=self.device,
+                )
+                graph = self.data_transform(data).to("cpu")
+                torch.save(graph, self.spgemnet_dir / f"{matid}.pt")
+                self.logger.info(
+                    f"Finish to process gemnet data with spatial nodes of {matid}"
+                )
 
 
-def process_chunk(matids: List[str], config: str, data_config: Dict[str, Any], device):
+def process_chunk(
+    matids: List[str],
+    config: str,
+    data_config: Dict[str, Any],
+    device,
+    sp,
+    cutoff,
+    max_neighbors,
+):
     """Process a chunk of materials with a single preprocessor instance."""
     init_config(config)
-    preprocessor = JMP(data_config, device)
+    preprocessor = JMP(data_config, device, sp, cutoff, max_neighbors)
     for matid in tqdm(matids):
         preprocessor.process_material(matid)
 
 
-def build_data(config, devices):
+def build_data(config, devices, sp):
     logger = get_logger(filename=Path(__file__).stem)
     logger.info("Starting JMP/GemNet data preprocessing")
 
@@ -174,6 +237,9 @@ def build_data(config, devices):
         init_config(config)
         data_config = get_data_config()
         model_config = get_model_config()
+
+        cutoff = model_config["gemnet"]["cutoff"]
+        max_neighbors = model_config["gemnet"]["max_num_neighbors"]
 
         # Get list of materials to process
         matid_df = data_config["matid_df"]
@@ -189,7 +255,8 @@ def build_data(config, devices):
         processes = []
         for device, chunk in zip(devices, matid_chunks):
             p = mp.Process(
-                target=process_chunk, args=(chunk, config, data_config, device)
+                target=process_chunk,
+                args=(chunk, config, data_config, device, sp, cutoff, max_neighbors),
             )
             p.start()
             processes.append(p)
@@ -212,7 +279,8 @@ def build_data(config, devices):
     required=True,
     help="Device to calculate edge_index, separated by comma",
 )
-def cli(config: str, devices: str):
+@click.option("--sp", is_flag=True)
+def cli(config: str, devices: str, sp: bool):
     """Command line interface for Graph preprocessing."""
     try:
         mp.set_start_method("spawn")
@@ -220,7 +288,7 @@ def cli(config: str, devices: str):
         logger = get_logger(filename=Path(__file__).stem)
         logger.info("Starting prebuilding data for jmp/gemnet")
         devices = devices.split(",")
-        build_data(config, devices)
+        build_data(config, devices, sp)
     except Exception as e:
         logger.critical(f"Graph CLI failed: {str(e)}", exc_info=True)
         raise

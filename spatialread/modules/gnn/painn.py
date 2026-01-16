@@ -5,10 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch_geometric.data import Data
+from torch_geometric.nn.models.jumping_knowledge import JumpingKnowledge
 
 # import .properties as properties
 # import .nn as snn
 from . import nn as snn
+from ..utils import MLP
 
 
 class PaiNNInteraction(nn.Module):
@@ -117,6 +119,27 @@ class PaiNNMixing(nn.Module):
         return q, mu
 
 
+class OutputBlock(nn.Module):
+    def __init__(self, n_atom_basis: int, radial_basis: Callable, activation: Callable):
+        super().__init__()
+        self.n_atom_basis = n_atom_basis
+        self.radial_basis = radial_basis
+        self.activation = activation
+
+        self.interatomic_context_net = nn.Sequential(
+            snn.Dense(n_atom_basis, n_atom_basis, activation=activation),
+            snn.Dense(n_atom_basis, 3 * n_atom_basis, activation=None),
+        )
+    
+    def forward(self, q, mu, Wij, dir_ij, idx_i, idx_j, n_atoms: int):
+        x = self.interatomic_context_net(q)
+        xj = x[idx_j]
+        x = Wij * xj
+        dq, _, _ = torch.split(x, self.n_atom_basis, dim=-1)
+        dq = snn.scatter_add(dq, idx_i, dim_size=n_atoms)
+        return dq
+
+
 class PaiNN(nn.Module):
     """PaiNN - polarizable interaction neural network
 
@@ -141,6 +164,7 @@ class PaiNN(nn.Module):
         epsilon: float = 1e-8,
         nuclear_embedding: Optional[nn.Module] = None,
         electronic_embeddings: Optional[List] = None,
+        jumping_knowledge: bool = False
     ):
         """
         Args:
@@ -215,6 +239,14 @@ class PaiNN(nn.Module):
 
         self.outnet = snn.build_mlp(n_in=n_atom_basis, n_out=1)
 
+        self.jumping_knowledge = jumping_knowledge
+
+        if self.jumping_knowledge is not None:
+            if self.jumping_knowledge == 'lstm':
+                self.jknet = JumpingKnowledge(self.jumping_knowledge, channels=self.n_atom_basis, num_layers=1)
+            else:
+                self.jknet = JumpingKnowledge(self.jumping_knowledge, channels=self.n_atom_basis)
+
     # def forward(self, inputs: Dict[str, torch.Tensor]):
     def forward(self, data: Data):
         """
@@ -251,6 +283,10 @@ class PaiNN(nn.Module):
         else:
             filter_list = torch.split(filters, 3 * self.n_atom_basis, dim=-1)
 
+        # if self.jumping_knowledge:
+        #     jk_filters = self.jk_filter_net(phi_ij) * fcut[..., None]
+        #     jk_filter_list = torch.split(jk_filters, 3 * self.n_atom_basis, dim=-1)
+
         # compute initial embeddings
         q = self.embedding(atomic_numbers)
         for embedding in self.electronic_embeddings:
@@ -260,12 +296,29 @@ class PaiNN(nn.Module):
         # compute interaction blocks and update atomic embeddings
         qs = q.shape
         mu = torch.zeros((qs[0], 3, qs[2]), device=q.device)
+        qout_list = []
         for i, (interaction, mixing) in enumerate(zip(self.interactions, self.mixing)):
             q, mu = interaction(q, mu, filter_list[i], dir_ij, idx_i, idx_j, n_atoms)
             q, mu = mixing(q, mu)
-        q = q.squeeze(1)
+            if self.jumping_knowledge is not None:
+                # qout = self.output_blocks[i](q, mu, jk_filter_list[i], dir_ij, idx_i, idx_j, n_atoms)
+                # qout = self.output_blocks[i](q)
+                # qout_list.append(qout.squeeze(1))
+                # print("DEBUG", qout.shape, q.shape)
+                qout_list.append(q.squeeze(1))
+            # q_list.append(q.squeeze(1)) # N_atoms, n_atom_basis
+        if self.jumping_knowledge is not None:
+            qout = torch.cat(qout_list, dim=1) # N_atoms, n_atom_basis * n_interactions
+            # qout = torch.stack(qout_list, dim=1) # N_atoms, n_interactions, n_atom_basis
+            # qout = self.out_mlp(qout) # N_atoms, n_atom_basis
+            # qout, _ = torch.max(qout, dim=1, keepdim=False)
+            qout = self.jknet(qout_list)
 
-        return q, mu
+            return qout, mu
+        else:
+            q = q.squeeze(1)
+
+            return q, mu
 
         # # collect results
         # inputs["scalar_representation"] = q

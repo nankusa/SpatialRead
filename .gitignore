@@ -11,8 +11,9 @@
 /baseline
 **/fig
 /configs/
-
-
+/rebuttle
+/lab
+/scripts
 
 
 # Byte-compiled / optimized / DLL files

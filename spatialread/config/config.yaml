@@ -6,25 +6,30 @@ data:
     graph: graph
     spgraph: spgraph
     gemnet: gemnet
+    spgemnet: spgemnet
 
   csv:
     matid: ~
 
-
-  json: ~
+  json:
+    matid2idx: matid2idx # used to gather information from different device, we need to conver the list of str to tensor
+    matidx2id: matidx2id
 
   # for crystal
   structure:
-    min_lat_len: 8.0 
+    min_lat_len: 8.0
     max_lat_len: ~
     max_num_atoms: ~
 
   spnode:
-    sample: uniform # Literal['uniform', 'inverse_density']
-    repulsion_distance: 1.0
+    enabled: true
     z: 120
-    num: 512
+    num: 8
+    sample: grid # Literal['uniform', 'inverse_density']
+    repulsion_distance: 1.0
+    kde_bandwidth: 1.0
 
+  pbc: true
   override: false
   num_process: 16
 
@@ -57,7 +62,7 @@ optimize:
   transformer:
     optim_type: "adamw"
     lr: 0.0001
-    weight_decay: 0.01
+    weight_decay: 0.1
     decay_power: "cosine"
     warmup_steps: 0.1
     max_steps: -1
@@ -66,7 +71,7 @@ optimize:
   reduce_on_plateau:
     optim_type: "adamw"
     lr: 0.001
-    weight_decay: 0.01
+    weight_decay: 0.1
     end_lr: 1.0e-6
     lr_monitor: val_loss
     monitor_mode: min
@@ -74,94 +79,23 @@ optimize:
     lr_factor: 0.8
     lr_threshold: 1.0e-4
 
-  jmp:
-    lr_scheduler:
-      last_step: -1
-      max_epochs: 32
-      max_steps: null
-      min_lr_factor: 0.1
-      name: warmup_cos_rlp
-      rlp:
-        cooldown: 0
-        eps: 1.0e-08
-        factor: 0.8
-        frequency: 1
-        interval: epoch
-        min_lr: 0.0
-        mode: min
-        monitor: null
-        name: rlp
-        patience: 3
-        threshold: 0.0001
-        threshold_mode: rel
-        warmup: null
-      should_restart: false
-      warmup_epochs: 2
-      warmup_start_lr_factor: 0.1
-      warmup_steps: null
-    optimizer:
-      amsgrad: false
-      betas: !!python/tuple
-      - 0.9
-      - 0.95
-      eps: 1.0e-08
-      lr: 0.0001
-      name: adamw
-      weight_decay: 0.01
-    parameter_specific_optimizers:
-      - lr_scheduler:
-          last_step: -1
-          max_epochs: 300
-          max_steps: null
-          min_lr_factor: 0.25
-          name: warmup_cos_rlp
-          rlp:
-            cooldown: 0
-            eps: 1.0e-08
-            factor: 0.8
-            frequency: 1
-            interval: epoch
-            min_lr: 0.0
-            mode: min
-            monitor: null
-            name: rlp
-            patience: 3
-            threshold: 0.0001
-            threshold_mode: rel
-            warmup: null
-          should_restart: false
-          warmup_epochs: 5
-          warmup_start_lr_factor: 0.1
-          warmup_steps: null
-        name: null
-        optimizer:
-          amsgrad: false
-          betas: !!python/tuple
-          - 0.9
-          - 0.95
-          eps: 1.0e-08
-          lr: 1.0e-04
-          name: adamw
-          weight_decay: 0.01
-        paremeter_patterns:
-        - torchmdnet.*
-        - visnet.*
-
 logger:
   enabled: true
   log_dir: ./logs
   filename: spatialread.log
-  format: '%(asctime)s - %(levelname)s - %(message)s'
+  format: "%(asctime)s - %(levelname)s - %(message)s"
   level: DEBUG
 
 model:
   gnn: painn
   head: transformer # Literal['transformer', 'spnode_mlp', 'atom_mlp']
+  mp_between_spnode: false
 
   head_mlp:
     nlayers: 3
     hid_dim: 128 # should be the same as gnn's feature dimension, most gnns use 128
     readout: mean
+    pool_feature: false
 
   transformer:
     nlayers: 6
@@ -181,10 +115,12 @@ model:
     electronic_embeddings: ~
     cutoff: 6.0
     max_num_neighbors: 30
+    jumping_knowledge: ~
 
   gemnet:
     hid_dim: 256
     ckpt: ./ckpt/jmp/jmp-s.pt
+    scale_file: ./spatialread/modules/gemnet/scale_files/small.pt
 
   visnet:
     # lmax: 2

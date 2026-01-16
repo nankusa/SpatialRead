@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 import torch
 from torch_geometric.data import Data
+from torch_geometric.nn.pool import radius_graph
 
 from ase.io import read
 from pymatgen.io.cif import CifParser
@@ -38,6 +39,7 @@ class GraphPreprocessor:
         self.max_num_atoms = config["structure"]["max_num_atoms"]
         self.spnode_z = config['spnode']['z']
         self.num_spnode = config['spnode']['num']
+        self.pbc = config['pbc']
 
         # Setup directories
         self.cif_dir = config["cif_dir"]
@@ -82,43 +84,60 @@ class GraphPreprocessor:
                 return False
 
             data.natoms = torch.tensor([len(data.atomic_numbers)], device=device)
-            data.cell = data.cell.reshape(
-                1, 3, 3
-            )  # for collate we unsqueeze one dimension
 
-            edge_index, cell_offsets, neighbors = radius_graph_pbc(
-                data,
-                radius=10,
-                max_num_neighbors_threshold=5000,
-                pbc=[True, True, True],
-                rep=[1, 1, 1]
-            )
+            if self.pbc:
+                data.cell = data.cell.reshape(
+                    1, 3, 3
+                )  # for collate we unsqueeze one dimension
 
-            out = get_pbc_distances(
-                data.pos,
-                edge_index,
-                data.cell,
-                cell_offsets,
-                neighbors,
-                return_offsets=True,
-                return_distance_vec=True,
-            )
+                edge_index, cell_offsets, neighbors = radius_graph_pbc(
+                    data,
+                    radius=10,
+                    max_num_neighbors_threshold=5000,
+                    # pbc=[True, True, True],
+                    # rep=[1, 1, 1]
+                )
 
-            edge_index: torch.Tensor = out["edge_index"]
-            edge_dist: torch.Tensor = out["distances"]
-            edge_vec: torch.Tensor = out["distance_vec"]
+                out = get_pbc_distances(
+                    data.pos,
+                    edge_index,
+                    data.cell,
+                    cell_offsets,
+                    neighbors,
+                    return_offsets=True,
+                    return_distance_vec=True,
+                )
 
-            # filter edge is left for training to dynamically set cutoff and max_num_neighbors
+                edge_index: torch.Tensor = out["edge_index"]
+                edge_dist: torch.Tensor = out["distances"]
+                edge_vec: torch.Tensor = out["distance_vec"]
 
-            # edge_index, edge_dist, edge_vec, [cell_offsets] = filter_edge(edge_index, edge_dist, edge_vec, 'p2pv', data.atomic_numbers==self.spnode_z, cutoff, max_neighbors, other_content=[cell_offsets])
+                # filter edge is left for training to dynamically set cutoff and max_num_neighbors
 
-            # neighbors[0] = edge_index.shape[1]
+                # edge_index, edge_dist, edge_vec, [cell_offsets] = filter_edge(edge_index, edge_dist, edge_vec, 'p2pv', data.atomic_numbers==self.spnode_z, cutoff, max_neighbors, other_content=[cell_offsets])
 
-            data["edge_index"] = edge_index
-            data["edge_dist"] = edge_dist
-            data["edge_vec"] = edge_vec
-            data["cell_offsets"] = cell_offsets
-            data['neighbors'] = neighbors
+                # neighbors[0] = edge_index.shape[1]
+
+                data["edge_index"] = edge_index
+                data["edge_dist"] = edge_dist
+                data["edge_vec"] = edge_vec
+                data["cell_offsets"] = cell_offsets
+                data['neighbors'] = neighbors
+            else:
+                edge_index = radius_graph(
+                    data.pos,
+                    r=10,
+                    max_num_neighbors=5000,
+                )
+
+                row, col = edge_index  # [2, E]
+                edge_vec = data.pos[col] - data.pos[row]           # [E, 3]
+                edge_dist = torch.norm(edge_vec, dim=-1)           # [E]
+
+                data["edge_index"] = edge_index
+                data["edge_vec"] = edge_vec
+                data["edge_dist"] = edge_dist
+
 
             torch.save(data.to("cpu"), self.graph_dir / f"{matid}.pt")
 

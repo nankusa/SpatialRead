@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn import Embedding, Linear, ModuleList, Sequential
+from torch_scatter import scatter
 
 from torch_geometric.data import Dataset, download_url, extract_zip, Data
 from torch_geometric.io import fs
@@ -23,14 +24,35 @@ from torch.autograd import grad
 from typing import Literal
 
 
-class SchNet(torch.nn.Module):
-    url = "http://www.quantum-machine.org/datasets/trained_schnet_models.zip"
+class update_u(torch.nn.Module):
+    def __init__(self, hidden_channels, out_channels):
+        super(update_u, self).__init__()
+        self.lin1 = Linear(hidden_channels, hidden_channels // 2)
+        self.act = ShiftedSoftplus()
+        self.lin2 = Linear(hidden_channels // 2, out_channels)
 
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.xavier_uniform_(self.lin1.weight)
+        self.lin1.bias.data.fill_(0)
+        torch.nn.init.xavier_uniform_(self.lin2.weight)
+        self.lin2.bias.data.fill_(0)
+
+    def forward(self, v, batch):
+        v = self.lin1(v)
+        v = self.act(v)
+        v = self.lin2(v)
+        u = scatter(v, batch, dim=0)
+        return u,v
+
+
+class SchNet(torch.nn.Module):
     def __init__(
         self,
         hidden_channels: int = 128,
         num_filters: int = 128,
-        num_interactions: int = 3,
+        num_interactions: int = 6,
         num_gaussians: int = 50,
         cutoff: float = 10.0,
         interaction_graph: Optional[Callable] = None,
@@ -40,6 +62,7 @@ class SchNet(torch.nn.Module):
         mean: Optional[float] = None,
         std: Optional[float] = None,
         atomref: OptTensor = None,
+        VNODE_Z: int = 120,
     ):
         super().__init__()
 
@@ -55,6 +78,8 @@ class SchNet(torch.nn.Module):
         self.std = std
         self.scale = None
 
+        self.VNODE_Z = VNODE_Z
+
         if self.dipole:
             import ase
 
@@ -63,16 +88,18 @@ class SchNet(torch.nn.Module):
 
         # Support z == 0 for padding atoms so that their embedding vectors
         # are zeroed and do not receive any gradients.
+        # NOTE: Here we choose a large number 125 to cover total 118 type of atoms and 1 additional virtual node and preserve some additional number for furthur improvement.
         self.embedding = Embedding(125, hidden_channels, padding_idx=0)
+
+        # cutoff = 8
+        # max_num_neighbors = 30
 
         if interaction_graph is not None:
             self.interaction_graph = interaction_graph
         else:
-            self.interaction_graph = RadiusInteractionGraph(
-                cutoff,
-                max_num_neighbors,
-            )
-
+            # self.interaction_graph = RadiusInteractionGraph(cutoff, max_num_neighbors)
+            self.interaction_graph = RadiusInteractionGraph(cutoff, max_num_neighbors)
+        
         self.distance_expansion = GaussianSmearing(0.0, cutoff, num_gaussians)
 
         self.interactions = ModuleList()
@@ -85,6 +112,8 @@ class SchNet(torch.nn.Module):
         self.lin1 = Linear(hidden_channels, hidden_channels // 2)
         self.act = ShiftedSoftplus()
         self.lin2 = Linear(hidden_channels // 2, 1)
+
+        self.update_u = update_u(hidden_channels, 1)
 
         self.register_buffer("initial_atomref", atomref)
         self.atomref = None
@@ -106,15 +135,12 @@ class SchNet(torch.nn.Module):
         if self.atomref is not None:
             self.atomref.weight.data.copy_(self.initial_atomref)
 
+    # NOTE: a modified version of orignal forward code considering virtual node
     def forward(
         self,
-        # data: Data,
-        # z,
-        h,
-        pos,
-        batch = None,
-        return_force: bool = False,
-        # h: Optional[Tensor] = None,
+        data: Data,
+        h: Optional[Tensor] = None,
+        force: bool = False
     ) -> Tensor:
         # def forward(self, z: Tensor, pos: Tensor, batch: OptTensor = None) -> Tensor:
         r"""Forward pass.
@@ -128,31 +154,73 @@ class SchNet(torch.nn.Module):
                 to a separate molecule with shape :obj:`[num_atoms]`.
                 (default: :obj:`None`)
         """
-        # z = data.atomic_numbers
-        # pos = data.pos
-        # batch = data.batch
+        if force:
+            self.train()
 
-        if return_force:
-            pos.requires_grad_()
+        z = data.atomic_numbers
+        pos = data.pos.clone()
+        batch = data.batch
+
+        # print("DEBUG", z.shape, pos.shape, batch.shape, z[:10], z[-10:], pos[:10], pos[-10:])
+
+        if force:
+            pos.requires_grad_(True)
 
         batch = torch.zeros_like(z) if batch is None else batch
 
-        # if h is None:
-        #     h = self.embedding(z)
-        # NOTE here we use the pre-computed version to ensure pbc for crystal
-        edge_index, edge_weight = self.interaction_graph(pos, batch)
-        # edge_index = data.edge_index
-        # edge_weight = data.edge_weight
+        if h is None:
+            h = self.embedding(z)
+
+        edge_index, edge_weight = data.edge_index, data.edge_weight
+
+        # # edge_index, edge_weight = self.interaction_graph(pos, batch)
+        # edge_index = radius_graph(pos, r=6, batch=batch, max_num_neighbors=30)
+        # edge_weight = (pos[edge_index[0]] - pos[edge_index[1]]).norm(dim=-1)
+
+        # # print("DEBUG", z.shape, (z!=120).sum(), pos.shape, edge_index.shape)
+
+
+        # # # indices = obtain_indices(data, edge_index, self.VNODE_Z, self.msg_direction)
+        # indices = z[edge_index[0]] != 120
+
+        # # print("DEBUG", indices.sum())
+
+        # edge_index = edge_index[:, indices]
+        # edge_weight = edge_weight[indices]
+        # edge_attr = edge_attr[indices]
+
         edge_attr = self.distance_expansion(edge_weight)
 
         for interaction in self.interactions:
+            # print("DEBUG", edge_index.shape, edge_weight.shape)
             h = h + interaction(h, edge_index, edge_weight, edge_attr)
 
-        # h = self.lin1(h)
-        # h = self.act(h)
-        # h = self.lin2(h)
+        feat = h.clone()
 
-        return h
+        # vn_indices = z == self.VNODE_Z
+        # pn_indices = z != self.VNODE_Z
+
+        # u,v = self.update_u(feat[vn_indices], batch[vn_indices])
+        u,v = self.update_u(feat, batch)
+
+        ret = {
+            "feat": feat,
+            "batch": batch,
+            # "vn_feat": feat[vn_indices],
+            # "vn_batch": batch[vn_indices],
+            # "pn_feat": feat[pn_indices],
+            # "pn_batch": batch[pn_indices],
+            # "vn_indices": vn_indices,
+            # "pn_indices": pn_indices
+        }
+
+        if force:
+            force = grad(outputs=u, inputs=pos, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
+            # ret['vn_force'] = force[vn_indices]
+            ret['force'] = force
+            # ret['pn_force'] = force[pn_indices]
+        
+        return ret
 
     def __repr__(self) -> str:
         return (
@@ -163,50 +231,6 @@ class SchNet(torch.nn.Module):
             f"num_gaussians={self.num_gaussians}, "
             f"cutoff={self.cutoff})"
         )
-
-
-# NOTE: a modified version of radius_graph to delete edges from virtual nodes to physical node
-class RadiusInteractionGraph(torch.nn.Module):
-    r"""Creates edges based on atom positions :obj:`pos` to all points within
-    the cutoff distance.
-
-    Args:
-        cutoff (float, optional): Cutoff distance for interatomic interactions.
-            (default: :obj:`10.0`)
-        max_num_neighbors (int, optional): The maximum number of neighbors to
-            collect for each node within the :attr:`cutoff` distance with the
-            default interaction graph method.
-            (default: :obj:`32`)
-    """
-
-    def __init__(
-        self,
-        cutoff: float = 10.0,
-        max_num_neighbors: int = 32,
-    ):
-        super().__init__()
-        self.cutoff = cutoff
-        self.max_num_neighbors = max_num_neighbors
-
-    def forward(
-        self, pos: Tensor, batch: Tensor
-    ) -> Tuple[Tensor, Tensor]:
-        r"""Forward pass.
-
-        Args:
-            pos (Tensor): Coordinates of each atom.
-            batch (LongTensor, optional): Batch indices assigning each atom to
-                a separate molecule.
-
-        :rtype: (:class:`LongTensor`, :class:`Tensor`)
-        """
-        edge_index = radius_graph(
-            pos, r=self.cutoff, batch=batch, max_num_neighbors=self.max_num_neighbors
-        )
-
-        row, col = edge_index
-        edge_weight = (pos[row] - pos[col]).norm(dim=-1)
-        return edge_index, edge_weight
 
 
 class InteractionBlock(torch.nn.Module):
@@ -243,6 +267,40 @@ class InteractionBlock(torch.nn.Module):
         x = self.act(x)
         x = self.lin(x)
         return x
+
+
+class RadiusInteractionGraph(torch.nn.Module):
+    r"""Creates edges based on atom positions :obj:`pos` to all points within
+    the cutoff distance.
+
+    Args:
+        cutoff (float, optional): Cutoff distance for interatomic interactions.
+            (default: :obj:`10.0`)
+        max_num_neighbors (int, optional): The maximum number of neighbors to
+            collect for each node within the :attr:`cutoff` distance with the
+            default interaction graph method.
+            (default: :obj:`32`)
+    """
+    def __init__(self, cutoff: float = 10.0, max_num_neighbors: int = 32):
+        super().__init__()
+        self.cutoff = cutoff
+        self.max_num_neighbors = max_num_neighbors
+
+    def forward(self, pos: Tensor, batch: Tensor) -> Tuple[Tensor, Tensor]:
+        r"""Forward pass.
+
+        Args:
+            pos (Tensor): Coordinates of each atom.
+            batch (LongTensor, optional): Batch indices assigning each atom to
+                a separate molecule.
+
+        :rtype: (:class:`LongTensor`, :class:`Tensor`)
+        """
+        edge_index = radius_graph(pos, r=self.cutoff, batch=batch,
+                                  max_num_neighbors=self.max_num_neighbors)
+        row, col = edge_index
+        edge_weight = (pos[row] - pos[col]).norm(dim=-1)
+        return edge_index, edge_weight
 
 
 class CFConv(MessagePassing):

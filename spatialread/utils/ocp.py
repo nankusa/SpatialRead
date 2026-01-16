@@ -61,6 +61,7 @@ def get_pbc_distances(
         out["distance_vec"] = distance_vectors[nonzero_idx]
 
     if return_offsets:
+        out["cell_offsets"] = cell_offsets[nonzero_idx]
         out["offsets"] = offsets[nonzero_idx]
 
     return out

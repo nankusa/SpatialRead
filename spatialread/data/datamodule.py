@@ -18,7 +18,6 @@ from spatialread.config import get_data_config, get_train_config, get_model_conf
 from spatialread.utils.log import Log
 from spatialread.utils.chem import atomic_number_to_symbol
 from spatialread.utils.metric import metric_classification, metric_regression
-from spatialread.utils.graph import get_pbc_distances
 
 from abc import ABC, abstractmethod
 from typing import Union, Dict, List, Any, Literal
@@ -49,57 +48,77 @@ class BaseDataset(Dataset, Log):
         self.root_dir = self.data_config["root_dir"]
         self.cif_dir = self.data_config["cif_dir"]
         self.matid_df = self.data_config[f"{self.split}_matid_df"]
+        self.matid2idx = self.data_config["matid2idx"]
 
-        if self.model_config['head'] == 'atom_mlp':
-            self.spgraph_dir = self.data_config["spgraph_dir"]
-            self.graph_dir = self.data_config['graph_dir']
-        elif self.model_config['head'] == 'spnode_mlp' or self.model_config['head'] == 'transformer':
-            self.spgraph_dir = self.data_config["spgraph_dir"]
-            self.graph_dir = self.data_config["graph_dir"]
-        else:
-            raise ValueError(f"Unsupported head {self.model_config['head']}")
+        self.enable_spnode = self.data_config["spnode"]["enabled"]
+        self.spgraph_dir = self.data_config["spgraph_dir"]
+        self.graph_dir = self.data_config["graph_dir"]
 
-        self.gemnet_dir = self.data_config['gemnet_dir']
+        self.gemnet_dir = self.data_config["gemnet_dir"]
+        self.spgemnet_dir = self.data_config["spgemnet_dir"]
 
-        self.max_num_atoms = self.data_config['structure']['max_num_atoms']
+        self.max_num_atoms = self.data_config["structure"]["max_num_atoms"]
 
     def _filter_max_num_atoms(self):
         if self.max_num_atoms is None:
             return
-        if 'num_atoms' not in self.matid_df:
-            for matid in tqdm(self.matid_df['matid']):
+        if "num_atoms" not in self.matid_df:
+            for matid in tqdm(self.matid_df["matid"]):
                 graph = torch.load(self.graph_dir / f"{matid}.pt", weights_only=False)
-                self.matid_df.loc[self.matid_df['matid'] == matid, 'num_atoms'] = graph.atomic_numbers.shape[0]
+                self.matid_df.loc[self.matid_df["matid"] == matid, "num_atoms"] = (
+                    graph.atomic_numbers.shape[0]
+                )
         if self.max_num_atoms is not None:
-            self.matid_df = self.matid_df[self.matid_df['num_atoms'] <= self.max_num_atoms]
+            self.matid_df = self.matid_df[
+                self.matid_df["num_atoms"] <= self.max_num_atoms
+            ]
 
         print(f"Filter max num atoms of {self.max_num_atoms}")
 
     def _load_structure(self, matid: str):
-        graph = torch.load(self.graph_dir / f"{matid}.pt", weights_only=False, map_location="cpu")
+        ret = {}
+
+        graph = torch.load(
+            self.graph_dir / f"{matid}.pt", weights_only=False, map_location="cpu"
+        )
 
         graph.natoms = torch.tensor([graph.atomic_numbers.shape[0]])
         graph.cell = graph.cell.reshape(1, 3, 3)
 
-        spgraph = torch.load(self.spgraph_dir / f"{matid}.pt", weights_only=False, map_location="cpu")
+        ret["graph"] = graph
 
-        spgraph.natoms = torch.tensor([spgraph.atomic_numbers.shape[0]])
-        spgraph.cell = spgraph.cell.reshape(1, 3, 3)
+        if self.enable_spnode:
+            spgraph = torch.load(
+                self.spgraph_dir / f"{matid}.pt", weights_only=False, map_location="cpu"
+            )
 
+            spgraph.natoms = torch.tensor([spgraph.atomic_numbers.shape[0]])
+            spgraph.cell = spgraph.cell.reshape(1, 3, 3)
 
-        if 'gemnet' in self.model_config['gnn']:
-            gemnet = torch.load(self.gemnet_dir / f"{matid}.pt", weights_only=False, map_location="cpu")
-            return {"graph": graph, "spgraph": spgraph, "gemnet": gemnet}
-        else:
-            return {"graph": graph, "spgraph": spgraph}
+            ret["spgraph"] = spgraph
+
+        if "gemnet" in self.model_config["gnn"]:
+            gemnet = torch.load(
+                self.gemnet_dir / f"{matid}.pt", weights_only=False, map_location="cpu"
+            )
+            ret["gemnet"] = gemnet
+            if self.enable_spnode:
+                spgemnet = torch.load(
+                    self.spgemnet_dir / f"{matid}.pt",
+                    weights_only=False,
+                    map_location="cpu",
+                )
+                ret["spgemnet"] = spgemnet
+
+        return ret
 
         # return {"graph": graph, "token": token, "coord": coord, "distance": distance, "edge_type": edge_type}
 
     def _load_gemnet(self, matid: str):
-        graph = torch.load(self.gemnet_dir / f'{matid}.pt', weights_only=False, map_location='cpu')
-        return {
-            "gemnet": graph
-        }
+        graph = torch.load(
+            self.gemnet_dir / f"{matid}.pt", weights_only=False, map_location="cpu"
+        )
+        return {"gemnet": graph}
 
     def __getitem__(self, idx: int):
         raise NotImplementedError
@@ -109,7 +128,11 @@ class BaseDataset(Dataset, Log):
         return len(self.matid_df)
 
     def collate_fn(
-        self, data_list: List[Dict[str, Union[str, torch.Tensor]]], list_keys=[], stack_keys=[], concat_keys=[]
+        self,
+        data_list: List[Dict[str, Union[str, torch.Tensor]]],
+        list_keys=[],
+        stack_keys=[],
+        concat_keys=[],
     ) -> Dict[str, Union[List[str], torch.Tensor]]:
         ret = {}
         for key in list_keys:
@@ -138,14 +161,18 @@ class FinetuneDataset(BaseDataset):
 
         self._filter_label()
 
-        if self.task_type == 'Regression':
+        if self.task_type == "Regression":
             self._set_statistic(mean, std)
 
     def _init_params(self) -> None:
         super()._init_params()
         self.task_name = self.train_config["task_name"]
-        self.task_type = self.train_config['task_type']
-        assert self.task_type in ['Regression', 'BinaryClassification', 'Classification'], f'Unsupported task type {self.task_type}'
+        self.task_type = self.train_config["task_type"]
+        assert self.task_type in [
+            "Regression",
+            "BinaryClassification",
+            "Classification",
+        ], f"Unsupported task type {self.task_type}"
 
     # def _load_structure(self, matid: str):
     #     ret = super()._load_structure(matid)
@@ -160,9 +187,7 @@ class FinetuneDataset(BaseDataset):
 
     def _filter_label(self) -> None:
         olen = len(self.matid_df)
-        self.matid_df = self.matid_df.dropna(
-            subset=[self.task_name]
-        )
+        self.matid_df = self.matid_df.dropna(subset=[self.task_name])
         self.log(f"Total [{len(self.matid_df)}/{olen}] mats with label")
 
     def _set_statistic(
@@ -184,25 +209,25 @@ class FinetuneDataset(BaseDataset):
     def _load_label(self, idx: int):
         matid = self.matid_df.iloc[idx]["matid"]
 
-        if self.task_type == 'Regression':
+        if self.task_type == "Regression":
             label = self.matid_df.iloc[idx][self.task_name]
             if hasattr(self, "_mean") and hasattr(self, "_std"):
                 label = (label - self._mean[self.task_name]) / self._std[self.task_name]
             return {self.task_name: torch.tensor([label]).float()}
-        elif self.task_type == 'BinaryClassification':
+        elif self.task_type == "BinaryClassification":
             label = self.matid_df.iloc[idx][self.task_name]
             return {self.task_name: torch.tensor([label]).float()}
-        elif self.task_type == 'Classification':
+        elif self.task_type == "Classification":
             label = self.matid_df.iloc[idx][self.task_name]
             label = torch.tensor([label]).long()
             return {self.task_name: label}
         else:
-            raise ValueError(f'Unsupported task type: {self.task_type}')
+            raise ValueError(f"Unsupported task type: {self.task_type}")
 
     def __getitem__(self, idx: int) -> Dict[str, Union[str, torch.Tensor]]:
         matid = self.matid_df.iloc[idx]["matid"]
 
-        ret = {"matid": matid}
+        ret = {"matid": torch.tensor([self.matid2idx[matid]], dtype=torch.int)}
         ret.update(self._load_structure(matid))
         ret.update(self._load_label(idx))
 
@@ -215,10 +240,19 @@ class FinetuneDataset(BaseDataset):
     ) -> Dict[str, Union[List[str], torch.Tensor]]:
         # return super().collate_fn(data_list, list_keys=['matid', 'graph'], stack_keys=['pes', 'token', 'coord', 'distance', 'edge_type'], concat_keys=[self.task_name])
         # return super().collate_fn(data_list, list_keys=['matid', 'graph'], stack_keys=[], concat_keys=[self.task_name])
-        list_keys = ['matid', 'graph', 'spgraph']
-        if 'gemnet' in self.model_config['gnn']:
-            list_keys.append('gemnet')
-        return super().collate_fn(data_list, list_keys=list_keys, stack_keys=[], concat_keys=[self.task_name])
+        list_keys = ["graph"]
+        if self.enable_spnode:
+            list_keys.append("spgraph")
+        if "gemnet" in self.model_config["gnn"]:
+            list_keys.append("gemnet")
+            if self.enable_spnode:
+                list_keys.append("spgemnet")
+        return super().collate_fn(
+            data_list,
+            list_keys=list_keys,
+            stack_keys=[],
+            concat_keys=["matid", self.task_name],
+        )
 
 
 class BaseDataModule(L.LightningDataModule):
@@ -230,7 +264,7 @@ class BaseDataModule(L.LightningDataModule):
 
     @abstractmethod
     def setup(self, DatasetCls, stage) -> None:
-        for split in ['train', 'val', 'test']:
+        for split in ["train", "val", "test"]:
             self.datasets[split] = DatasetCls(split)
 
     def train_dataloader(self) -> DataLoader:
@@ -268,16 +302,20 @@ class BaseDataModule(L.LightningDataModule):
 class FinetuneDatamodule(BaseDataModule):
     def setup(self, stage: str = None) -> None:
         self.datasets["train"] = FinetuneDataset("train")
-        task_type = self.train_config['task_type']
-        if task_type == 'Regression':
+        task_type = self.train_config["task_type"]
+        if task_type == "Regression":
+            # self._mean = 602.9007780432183
+            # self._std = 471.03858838413055
             self._mean = self.datasets["train"]._mean
             self._std = self.datasets["train"]._std
+
+            print("Normalize with params: ", self._mean, self._std)
 
             # Then setup validation and test sets using the same statistics
             self.datasets["val"] = FinetuneDataset("val", self._mean, self._std)
             self.datasets["test"] = FinetuneDataset("test", self._mean, self._std)
-        elif task_type == 'BinaryClassification' or task_type == 'Classification':
+        elif task_type == "BinaryClassification" or task_type == "Classification":
             self.datasets["val"] = FinetuneDataset("val")
             self.datasets["test"] = FinetuneDataset("test")
         else:
-            raise ValueError('Unsupported task type', task_type)
+            raise ValueError("Unsupported task type", task_type)
