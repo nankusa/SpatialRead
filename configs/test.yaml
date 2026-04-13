@@ -1,0 +1,90 @@
+data:
+  root_dir: ./data/test
+
+  folder:
+    cif: cif
+    graph: graph
+    spgraph: spgraph
+
+  csv:
+    matid: benchmark
+
+  structure:
+    min_lat_len: 8.0
+    max_lat_len: ~
+    max_num_atoms: ~
+
+  spnode:
+    sample: grid # Literal['uniform', 'inverse_density', 'grid']
+    repulsion_distance: 1.0
+    z: 120
+    num: 8
+
+  override: false
+  num_process: 8
+
+train:
+  task_name: N2-77-100000 # str: e.g. adsorption, should have a corresponding column in csv
+  task_type: Regression # Literal["Regression", "BinaryClassification"]
+
+  max_epochs: 30
+  accelerator: gpu
+  strategy: ddp_find_unused_parameters_true
+  accumulate_grad_batches: 1
+  precision: 32
+  log_every_n_steps: 20
+  gradient_clip_val: 1.0
+  batch_size: 8
+  num_workers: 8
+
+  loss_weight: ~ # Dict: e.g. {"task": 1.0, "site_offset": 1.0...}
+
+  device: [0]
+  log_dir: ./lightning_logs/painn_spnode_mlp/coremof
+  ckpt_path: ~
+  resume: ~
+
+model:
+  gnn: painn
+  head: spnode_mlp # Literal['transformer', 'spnode_mlp', 'atom_mlp']
+  mp_between_spnode: true
+
+  head_mlp:
+    nlayers: 3
+    hid_dim: 128 # should be the same as gnn's feature dimension, most gnns use 128
+    readout: mean
+    pool_feature: true
+
+  transformer:
+    nlayers: 6
+    hid_dim: 128
+    nheads: 8
+    ff_dim: 512
+    dropout: 0.15
+    batch_first: true
+    max_seq_len: 1024
+
+  painn:
+    n_atom_basis: 128
+    n_interactions: 6
+    shared_interactions: False
+    shared_filters: False
+    epsilon: 1.0e-8
+    nuclear_embedding: ~
+    electronic_embeddings: ~
+    cutoff: 8.0
+    max_num_neighbors: 30
+
+optimize:
+  type: reduce_on_plateau
+
+  reduce_on_plateau:
+    optim_type: "adamw"
+    lr: 0.0001
+    weight_decay: 0.0
+    end_lr: 1.0e-6
+    lr_monitor: val_loss
+    monitor_mode: min
+    lr_patience: 10
+    lr_factor: 0.8
+    lr_threshold: 1.0e-4

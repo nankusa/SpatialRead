@@ -6,11 +6,12 @@
 /data/test/*
 !/data/test/cif
 !/data/test/benchmark*
+!/data/test/matid2idx.json
+!/data/test/matidx2id.json
 **/output
 **/repo
 /baseline
 **/fig
-/configs/
 /rebuttle
 /lab
 /scripts
